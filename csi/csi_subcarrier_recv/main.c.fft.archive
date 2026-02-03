@@ -1,0 +1,200 @@
+#include <stdio.h>
+#include <math.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+
+#include "ping/ping_sock.h"
+#include "esp_dsp.h"  // esp-dsp FFT + Window
+
+static const char *TAG = "CSI_FFT_WIN";
+
+// ===== Wi-Fi 設定 =====
+#define WIFI_SSID      "PICO-AP"
+#define WIFI_PASS      "pico_pass"
+
+// FFT のサイズ（2^n）
+#define FFT_SIZE 256
+
+static EventGroupHandle_t wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+
+// CSI バッファ（実部/虚部インターリーブ）
+static volatile uint32_t csi_idx = 0;
+static float csi_buffer[FFT_SIZE * 2];  // real/im pairs
+
+// 窓関数バッファ
+static float window_buf[FFT_SIZE];
+
+// FFT タスクハンドル
+static TaskHandle_t fft_task_handle = NULL;
+
+// ===== CSI RX コールバック =====
+static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
+{
+    if (!info || !info->buf) return;
+
+    for (int i = 0; i < info->len && csi_idx < FFT_SIZE; i += 2) {
+        float I = info->buf[i];
+        float Q = info->buf[i + 1];
+        float amp = sqrtf(I * I + Q * Q);
+
+        // 窓関数を掛けて real 部に格納
+        csi_buffer[csi_idx * 2 + 0] = amp * window_buf[csi_idx];
+        csi_buffer[csi_idx * 2 + 1] = 0.0f; // imaginary part
+        csi_idx++;
+    }
+
+    // バッファfull ==> FFT タスク通知
+    if (csi_idx >= FFT_SIZE) {
+        csi_idx = 0;
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        vTaskNotifyGiveFromISR(fft_task_handle, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR();  // 優先度が高いタスクが起きる場合はコンテキストスイッチ
+    }
+}
+
+// ===== Wi-Fi イベントハンドラ =====
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+// ===== Wi-Fi 初期化（STA + CSI） =====
+static void wifi_init_csi_sta(void)
+{
+    wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID,
+        &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP,
+        &wifi_event_handler, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // STA 接続完了待ち
+    xEventGroupWaitBits(wifi_event_group,
+                        WIFI_CONNECTED_BIT,
+                        false,
+                        true,
+                        portMAX_DELAY);
+
+    // CSI 設定
+    wifi_csi_config_t csi_cfg = {
+        .lltf_en = true,
+        .htltf_en = true,
+        .stbc_htltf2_en = true,
+        .ltf_merge_en = true,
+        .channel_filter_en = false,
+        .manu_scale = true,
+        .shift = 3
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_rx_cb, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+    ESP_LOGI(TAG, "WiFi STA connected, CSI enabled");
+}
+
+// ===== FFT タスク =====
+static void fft_task(void* param)
+{
+    // 窓関数を生成（Hann または Blackman）
+    dsps_wind_hann_f32(window_buf, FFT_SIZE);   // Hann 窓
+    // dsps_wind_blackman_f32(window_buf, FFT_SIZE); // Blackman なども可 :contentReference[oaicite:0]{index=0}
+
+    // FFT テーブル初期化
+    dsps_fft2r_init_fc32(NULL, FFT_SIZE);
+
+    while (1) {
+        // 通知待ち（ISR から通知）
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // FFT 実行（インプレース）
+        dsps_fft2r_fc32(csi_buffer, FFT_SIZE);
+        dsps_bit_rev_fc32(csi_buffer, FFT_SIZE);
+
+        // 結果を UART に出力
+        printf("FFT:");
+        for (int i = 0; i < FFT_SIZE / 2; i++) {
+            float re = csi_buffer[i * 2];
+            float im = csi_buffer[i * 2 + 1];
+            float mag = sqrtf(re * re + im * im);
+            printf(" %.1f", mag);
+        }
+        printf("\n");
+    }
+}
+
+// ===== Ping 開始 =====
+static void wifi_ping_router_start(void)
+{
+    ESP_LOGI(TAG, "Start ping to trigger CSI");
+
+    esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
+    ping_config.count       = 0;
+    ping_config.interval_ms = 1000 / 50;      // 10 Hz など
+    ping_config.data_size   = 1;
+
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip_info);
+    ping_config.target_addr.u_addr.ip4.addr = ip4_addr_get_u32(&ip_info.gw);
+    ping_config.target_addr.type = ESP_IPADDR_TYPE_V4;
+
+    esp_ping_handle_t ping_handle = NULL;
+    ESP_ERROR_CHECK(esp_ping_new_session(&ping_config, NULL, &ping_handle));
+    ESP_ERROR_CHECK(esp_ping_start(ping_handle));
+}
+
+void app_main(void)
+{
+    // NVS 初期化
+    ESP_ERROR_CHECK(nvs_flash_init());
+
+    // STA + CSI
+    wifi_init_csi_sta();
+
+    // FFT タスク生成
+    xTaskCreate(fft_task, "fft_task", 4096, NULL, 5, &fft_task_handle);
+
+    // Ping 送信開始
+    wifi_ping_router_start();
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
